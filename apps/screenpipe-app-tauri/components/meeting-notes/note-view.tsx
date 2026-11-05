@@ -103,6 +103,7 @@ import {
 import { cn } from "@/lib/utils";
 import { AttendeesPill } from "./attendees-pill";
 import { MeetingAppLabel } from "./meeting-app-label";
+import { autoEndPromptFor, type AutoEndPrompt } from "./meeting-auto-end";
 import { CalendarNudge } from "./calendar-nudge";
 import { Receipts } from "./receipts";
 import { ReplayStrip } from "./replay-strip";
@@ -380,7 +381,9 @@ export function NoteView({
   const [audioStatusDevices, setAudioStatusDevices] = useState<
     AudioStatusDevice[]
   >([]);
-  const [inactivityPrompt, setInactivityPrompt] = useState(false);
+  const [autoEndPrompt, setAutoEndPrompt] = useState<AutoEndPrompt | null>(
+    null,
+  );
   const [dismissedJoinUrl, setDismissedJoinUrl] = useState<string | null>(null);
   // Which overflow action is awaiting confirmation. One dialog is shared so a
   // menu item can open it without nesting a trigger inside the menu.
@@ -1009,14 +1012,14 @@ export function NoteView({
         ) {
           return;
         }
-        const error = payload.error?.toLowerCase() ?? "";
-        if (
-          !payload.active &&
-          error.includes("auto-ended") &&
-          error.includes("inactive")
-        ) {
-          setInactivityPrompt(true);
+        // A meeting can come back on its own after an auto-end, and the banner
+        // must not resurface once that later session ends normally.
+        if (payload.active) {
+          setAutoEndPrompt(null);
+          return;
         }
+        const prompt = autoEndPromptFor(payload);
+        if (prompt) setAutoEndPrompt(prompt);
       },
     );
 
@@ -1610,8 +1613,8 @@ export function NoteView({
     return { link, mapped };
   }, [calendarEvents, dismissedJoinUrl, isLive, meeting, meetingCtx]);
 
-  const handleResumeAfterInactivity = async () => {
-    setInactivityPrompt(false);
+  const handleResumeAfterAutoEnd = async () => {
+    setAutoEndPrompt(null);
     await onResume();
   };
 
@@ -1809,9 +1812,9 @@ export function NoteView({
   // The footer exists to report something. A finished meeting that is not
   // recording, summarizing, failing or saving has nothing to report, and its
   // resting caption ("meeting saved") was pure reassurance, so the whole bar
-  // goes away rather than shrinking. The inactivity prompt is the one banner
+  // goes away rather than shrinking. The auto-end prompt is the one banner
   // that can appear while not live, so it has to keep the bar alive.
-  const footerVisible = footerHasNews || (!isLive && Boolean(inactivityPrompt));
+  const footerVisible = footerHasNews || (!isLive && Boolean(autoEndPrompt));
   const transcriptActionLabel = transcriptOpen
     ? "hide transcript"
     : "show transcript";
@@ -2643,11 +2646,12 @@ export function NoteView({
       {footerVisible && (
       <footer className="z-30 min-w-0 shrink-0 border-t border-border bg-background">
         <div className={cn(MEETING_SHELL_CLASS, "py-3")}>
-          {!isLive && inactivityPrompt && (
-            <InactivityResumeBanner
+          {!isLive && autoEndPrompt && (
+            <AutoEndResumeBanner
+              reason={autoEndPrompt}
               resuming={resuming}
-              onDismiss={() => setInactivityPrompt(false)}
-              onResume={() => void handleResumeAfterInactivity()}
+              onDismiss={() => setAutoEndPrompt(null)}
+              onResume={() => void handleResumeAfterAutoEnd()}
             />
           )}
           {isLive && joinSuggestion && (
@@ -3015,11 +3019,13 @@ function JoinMeetingSuggestion({
   );
 }
 
-function InactivityResumeBanner({
+function AutoEndResumeBanner({
+  reason,
   resuming,
   onDismiss,
   onResume,
 }: {
+  reason: AutoEndPrompt;
   resuming: boolean;
   onDismiss: () => void;
   onResume: () => void;
@@ -3030,7 +3036,9 @@ function InactivityResumeBanner({
       <div className="flex min-w-0 items-center gap-3">
         <Info className="h-4 w-4 shrink-0 text-muted-foreground" />
         <span className="text-sm leading-snug text-foreground">
-          Stopped transcribing after 15 minutes of inactivity
+          {reason === "time-limit"
+            ? "Stopped transcribing at the live time limit"
+            : "Stopped transcribing after 15 minutes of inactivity"}
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-1">
@@ -3063,7 +3071,7 @@ function InactivityResumeBanner({
           size="sm"
           className="h-8 w-8 rounded-md p-0 text-muted-foreground hover:text-foreground sm:hidden"
           onClick={onDismiss}
-          aria-label={ui("Dismiss inactivity message")}
+          aria-label={ui("Dismiss this message")}
         >
           <X className="h-3.5 w-3.5" />
         </Button>

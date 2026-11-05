@@ -15,7 +15,10 @@ use tokio::{
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::{core::engine::AudioTranscriptionEngine, transcription::engine::TranscriptionEngine};
+use crate::{
+    core::engine::AudioTranscriptionEngine, meeting_detector::MeetingDetector,
+    transcription::engine::TranscriptionEngine,
+};
 
 use super::{
     deepgram_live,
@@ -34,12 +37,23 @@ use super::{
 /// because recording bounced mid-meeting.
 pub const MEETING_STREAMING_REATTACH_EVENT: &str = "meeting_streaming_reattach";
 
+/// `reason` on `meeting_auto_end_requested` when a meeting reaches the live time
+/// limit. Public so the desktop app can tell it apart from a meeting going quiet.
+pub const MEETING_AUTO_END_TIME_LIMIT_REASON: &str = "live meeting maximum duration reached";
+
 const LIVE_FINAL_PERSIST_ATTEMPTS: usize = 18;
 const LIVE_FINAL_PERSIST_RETRY_DELAY: Duration = Duration::from_secs(5);
 const PROVIDER_STREAM_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 const LIVE_INACTIVITY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const LIVE_NO_AUDIO_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long a live session may run before it has to show the call is still
+/// going. A session no sensor can vouch for (a manual meeting, or no detector)
+/// ends here; a detected call gets another window. See
+/// `extend_live_duration_limit`.
 const LIVE_MAX_SESSION_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+/// The hard ceiling. Detected calls stop earning extensions here, so a sensor
+/// stuck on a dead call over a noisy mic still can't stream forever.
+const LIVE_HARD_MAX_SESSION_DURATION: Duration = Duration::from_secs(12 * 60 * 60);
 /// Half of a typical 30s chunk. Chunks whose timestamp falls within this
 /// window of any live transcript are considered "live-covered" and get
 /// marked `transcribed` so the background reconciler skips them. Gaps wider
@@ -61,8 +75,8 @@ const STALL_VOICED_AUDIO_RECENCY: Duration = Duration::from_secs(45);
 /// Each rebase buys another full `LIVE_NO_AUDIO_ACTIVITY_TIMEOUT`, so this is
 /// deliberately small: a genuinely dead capture path must still end the
 /// meeting rather than hold an empty session open forever. Four rebases caps
-/// the extension at roughly an hour, and `LIVE_MAX_SESSION_DURATION` remains
-/// the hard ceiling regardless.
+/// the extension at roughly an hour, and the session's max-duration limit
+/// still applies regardless.
 const MAX_CAPTURE_DISRUPTION_REBASES: u32 = 4;
 
 #[derive(Debug)]
@@ -72,6 +86,10 @@ struct ActiveMeetingStream {
     config: MeetingStreamingConfig,
     live_transcription_enabled: bool,
     started_at: Instant,
+    // Session age at which the max-duration check next fires. Kept apart from
+    // `started_at` because the stall notifications read that as the session's
+    // real age, and an extension must not reset them.
+    live_duration_limit: Duration,
     audio_frames_seen: u64,
     audio_samples_seen: u64,
     last_audio_activity_at: Instant,
@@ -118,6 +136,7 @@ pub fn start_meeting_streaming_loop(
     db: Arc<DatabaseManager>,
     transcription_engine: Arc<RwLock<Option<TranscriptionEngine>>>,
     on_insert: Option<crate::transcription::AudioInsertCallback>,
+    meeting_detector: Arc<RwLock<Option<Arc<MeetingDetector>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if !config.enabled {
@@ -344,6 +363,16 @@ pub fn start_meeting_streaming_loop(
                             );
                         }
                         check_and_emit_stall_notifications(session, Instant::now());
+                        let detector = meeting_detector.read().await.clone();
+                        if extend_live_duration_limit(session, detector.as_deref(), Instant::now())
+                        {
+                            info!(
+                                "meeting streaming: live limit reached but the call is still \
+                                 running — continuing (next check at {}m, meeting_id={})",
+                                session.live_duration_limit.as_secs() / 60,
+                                session.meeting_id,
+                            );
+                        }
                     }
                     if let Some(reason) = active
                         .as_ref()
@@ -425,6 +454,7 @@ async fn start_streaming_session(
         config: session_config.clone(),
         live_transcription_enabled,
         started_at: Instant::now(),
+        live_duration_limit: LIVE_MAX_SESSION_DURATION,
         audio_frames_seen: 0,
         audio_samples_seen: 0,
         last_audio_activity_at: Instant::now(),
@@ -942,7 +972,43 @@ fn check_and_emit_stall_notifications(session: &mut ActiveMeetingStream, now: In
 
 fn should_request_auto_end_for_max_duration(session: &ActiveMeetingStream, now: Instant) -> bool {
     session.live_transcription_enabled
-        && now.duration_since(session.started_at) >= LIVE_MAX_SESSION_DURATION
+        && now.duration_since(session.started_at) >= session.live_duration_limit
+}
+
+/// Whether a sensor currently sees a real call, as opposed to a meeting that
+/// is only open because someone started it. The detector drops the flag as
+/// soon as it stops seeing the call, and a manual meeting has no sensor behind
+/// it, so `manual` means nothing vouches for it.
+fn detector_confirms_live_call(detector: Option<&MeetingDetector>) -> bool {
+    detector.is_some_and(|detector| {
+        detector.is_in_meeting()
+            && !detector
+                .active_meeting()
+                .is_some_and(|meeting| meeting.manual)
+    })
+}
+
+/// Give a session that hit its limit another window when the call is still
+/// running.
+///
+/// Ending a detected call here is what cut long calls off mid-sentence: the
+/// meeting closed, the detector blocked that audio session from restarting it,
+/// and meetings-only capture released the devices for the rest of the call.
+/// Silence is still covered, since the inactivity timeout is independent of
+/// this limit.
+fn extend_live_duration_limit(
+    session: &mut ActiveMeetingStream,
+    detector: Option<&MeetingDetector>,
+    now: Instant,
+) -> bool {
+    if !should_request_auto_end_for_max_duration(session, now)
+        || session.live_duration_limit >= LIVE_HARD_MAX_SESSION_DURATION
+        || !detector_confirms_live_call(detector)
+    {
+        return false;
+    }
+    session.live_duration_limit += LIVE_MAX_SESSION_DURATION;
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -955,21 +1021,21 @@ impl AutoEndReason {
     fn event_reason(self) -> &'static str {
         match self {
             Self::Inactive => "live audio inactive",
-            Self::MaxDuration => "live meeting maximum duration reached",
+            Self::MaxDuration => MEETING_AUTO_END_TIME_LIMIT_REASON,
         }
     }
 
     fn log_message(self) -> &'static str {
         match self {
             Self::Inactive => "15m without live audio activity",
-            Self::MaxDuration => "2h maximum live duration reached",
+            Self::MaxDuration => "maximum live duration reached",
         }
     }
 
     fn status_message(self) -> &'static str {
         match self {
             Self::Inactive => "meeting auto-ended after live audio became inactive",
-            Self::MaxDuration => "meeting auto-ended after the 2 hour live limit",
+            Self::MaxDuration => "meeting auto-ended at the live time limit",
         }
     }
 }
@@ -1079,6 +1145,7 @@ fn emit_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meeting_detector::ActiveMeeting;
 
     #[tokio::test]
     async fn persisted_live_finals_notify_timeline_with_distinct_turn_ids() {
@@ -1143,6 +1210,7 @@ mod tests {
                 .with_provider(MeetingStreamingProvider::SelectedEngine),
             live_transcription_enabled: live,
             started_at: now,
+            live_duration_limit: LIVE_MAX_SESSION_DURATION,
             audio_frames_seen: 0,
             audio_samples_seen: 0,
             last_audio_activity_at: now,
@@ -1428,6 +1496,137 @@ mod tests {
         );
     }
 
+    fn detector_with(in_meeting: bool, manual: Option<bool>) -> MeetingDetector {
+        let detector = MeetingDetector::new();
+        detector.set_v2_in_meeting(in_meeting);
+        detector.set_active_meeting(manual.map(|manual| ActiveMeeting {
+            pid: None,
+            bundle_id: None,
+            manual,
+        }));
+        detector
+    }
+
+    /// A session at `age` that is still hearing audio, so only the
+    /// max-duration limit can end it.
+    fn session_aged(age: Duration) -> (ActiveMeetingStream, Instant) {
+        let started_at = Instant::now();
+        let now = started_at + age;
+        let mut session = test_session(started_at, true);
+        session.last_audio_activity_at = now;
+        (session, now)
+    }
+
+    #[test]
+    fn only_a_call_a_sensor_still_sees_counts_as_confirmed() {
+        assert!(!detector_confirms_live_call(None));
+        assert!(!detector_confirms_live_call(Some(&detector_with(
+            false, None
+        ))));
+        assert!(
+            !detector_confirms_live_call(Some(&detector_with(true, Some(true)))),
+            "a manual meeting has no sensor behind it"
+        );
+        assert!(detector_confirms_live_call(Some(&detector_with(
+            true,
+            Some(false)
+        ))));
+        assert!(
+            detector_confirms_live_call(Some(&detector_with(true, None))),
+            "a restored auto meeting raises the flag before its identity is republished"
+        );
+    }
+
+    /// Issue #7879: the limit used to end a healthy call mid-sentence.
+    #[test]
+    fn detected_call_gets_another_window_at_the_limit() {
+        let (mut session, now) = session_aged(LIVE_MAX_SESSION_DURATION);
+        let started_at = session.started_at;
+        let detector = detector_with(true, Some(false));
+
+        assert!(extend_live_duration_limit(
+            &mut session,
+            Some(&detector),
+            now
+        ));
+
+        assert_eq!(auto_end_reason(&session, now), None);
+        assert_eq!(
+            session.live_duration_limit,
+            LIVE_MAX_SESSION_DURATION * 2,
+            "the next check is one full window away"
+        );
+        assert_eq!(
+            session.started_at, started_at,
+            "stall notifications read this as the session's real age"
+        );
+    }
+
+    #[test]
+    fn session_under_the_limit_is_left_alone() {
+        let (mut session, now) = session_aged(LIVE_MAX_SESSION_DURATION / 2);
+
+        assert!(!extend_live_duration_limit(
+            &mut session,
+            Some(&detector_with(true, Some(false))),
+            now
+        ));
+        assert_eq!(session.live_duration_limit, LIVE_MAX_SESSION_DURATION);
+    }
+
+    #[test]
+    fn meeting_no_sensor_vouches_for_still_ends_at_the_limit() {
+        for detector in [
+            None,
+            Some(detector_with(false, None)),
+            Some(detector_with(true, Some(true))),
+        ] {
+            let (mut session, now) = session_aged(LIVE_MAX_SESSION_DURATION);
+
+            assert!(!extend_live_duration_limit(
+                &mut session,
+                detector.as_ref(),
+                now
+            ));
+            assert_eq!(
+                auto_end_reason(&session, now),
+                Some(AutoEndReason::MaxDuration)
+            );
+        }
+    }
+
+    #[test]
+    fn extended_session_still_ends_on_silence() {
+        let (mut session, now) = session_aged(LIVE_MAX_SESSION_DURATION);
+        session.last_audio_activity_at = session.started_at;
+
+        assert!(extend_live_duration_limit(
+            &mut session,
+            Some(&detector_with(true, Some(false))),
+            now
+        ));
+
+        assert_eq!(
+            auto_end_reason(&session, now),
+            Some(AutoEndReason::Inactive),
+            "an extension buys time against the limit, not against silence"
+        );
+    }
+
+    #[test]
+    fn hard_ceiling_stops_extensions_for_a_detected_call() {
+        let (mut session, now) = session_aged(LIVE_HARD_MAX_SESSION_DURATION);
+        let detector = detector_with(true, Some(false));
+
+        while extend_live_duration_limit(&mut session, Some(&detector), now) {}
+
+        assert_eq!(session.live_duration_limit, LIVE_HARD_MAX_SESSION_DURATION);
+        assert_eq!(
+            auto_end_reason(&session, now),
+            Some(AutoEndReason::MaxDuration)
+        );
+    }
+
     /// The regression this exists for: the machine sleeps (or the display
     /// layout changes) mid-meeting, audio streams are invalidated, frames
     /// stop, and the session ends itself while the user is still talking.
@@ -1529,7 +1728,7 @@ mod tests {
         );
     }
 
-    /// Max duration is the hard ceiling: capture grace must not defeat it.
+    /// Capture grace must not defeat the max-duration limit.
     #[test]
     fn capture_grace_does_not_extend_past_max_session_duration() {
         let now = Instant::now();
@@ -1541,7 +1740,7 @@ mod tests {
         assert_eq!(
             auto_end_reason(&session, now),
             Some(AutoEndReason::MaxDuration),
-            "the 2h ceiling still applies after a rebase"
+            "the limit still applies after a rebase"
         );
     }
 

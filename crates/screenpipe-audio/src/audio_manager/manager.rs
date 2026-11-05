@@ -570,6 +570,7 @@ impl AudioManager {
                     self.db.clone(),
                     self.engine.clone(),
                     self.on_transcription_insert.clone(),
+                    self.meeting_detector.clone(),
                 ));
             }
         }

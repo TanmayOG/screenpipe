@@ -529,7 +529,8 @@
         "src/meeting_watcher/ui_scan/tests.rs",
         "src/meeting_watcher/ui_scan/macos.rs",
         "src/meeting_watcher/ui_scan/windows.rs",
-        "tests/meeting_detection_eval.rs"
+        "tests/meeting_detection_eval.rs",
+        "tests/meeting_live_limit_test.rs"
       ],
       "platforms": [
         "windows",

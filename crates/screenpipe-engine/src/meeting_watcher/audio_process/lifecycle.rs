@@ -226,6 +226,7 @@ pub(crate) async fn start_or_adopt_auto_meeting_guarded(
                         ),
                     }
                 }
+                crate::meeting_watcher::shared::events::reattach_live_streaming(&recent);
                 if let Ok(meeting) = db.get_meeting_by_id(recent.id).await {
                     capture_detection_decision(&meeting, "audio_process_reopen", None);
                 }

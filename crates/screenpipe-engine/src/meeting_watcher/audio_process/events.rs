@@ -4,6 +4,7 @@
 //! Event signals (calendar, stop, auto-end) consumed by the audio-process loop.
 
 use super::*;
+use screenpipe_audio::meeting_streaming::MEETING_AUTO_END_TIME_LIMIT_REASON;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const ROOM_CHANGE_RESPONSE_EVENT: &str = "meeting_room_change_response";
@@ -109,10 +110,19 @@ pub(crate) async fn handle_auto_end_request(
                 }
             }
             if detector_matches {
-                if let Some(session) =
-                    active_or_ending_suppressed_session(state, request.meeting_id)
-                {
-                    suppress_session(suppressed_sessions, session);
+                // A detected call someone adopted by hand only stops here because
+                // a manual meeting has no sensor behind it. Leave its session free
+                // so the next poll re-checks it and the detector takes it back if
+                // the call is still running. Every other end keeps the block, or
+                // the meeting would restart at once and defeat the limit.
+                let recheck_call = manual_matches
+                    && request.reason.as_deref() == Some(MEETING_AUTO_END_TIME_LIMIT_REASON);
+                if !recheck_call {
+                    if let Some(session) =
+                        active_or_ending_suppressed_session(state, request.meeting_id)
+                    {
+                        suppress_session(suppressed_sessions, session);
+                    }
                 }
                 *state = AudioProcessMeetingState::Idle;
             }

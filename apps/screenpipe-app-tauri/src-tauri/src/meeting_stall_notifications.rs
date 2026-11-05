@@ -12,12 +12,18 @@
 //! - transcript stall → in-app `/notify` panel. The user is presumably already
 //!   looking at the empty live note pane wondering what's wrong; the panel
 //!   shows up there with a deep link.
+//! - live time limit → OS-level notification, for the same reason as an audio
+//!   stall: the call may still be running with nothing being captured. Waits
+//!   briefly first, because the detector can pick the meeting straight back up.
 //!
 //! Each presentation is gated by a `notificationPrefs` toggle; both default to
 //! true. Toggling them off in Settings → Notifications silences this module
 //! completely.
 
+use std::time::Duration;
+
 use futures::StreamExt;
+use screenpipe_audio::meeting_streaming::MEETING_AUTO_END_TIME_LIMIT_REASON;
 use serde::Deserialize;
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
@@ -26,6 +32,11 @@ use tracing::{debug, error, warn};
 use crate::notifications::client;
 use crate::notifications::store::NotificationPriority;
 use crate::store::SettingsStore;
+
+/// How long a meeting that hit the live time limit gets to come back before the
+/// user is told. With a call still on the mic the detector picks a manual
+/// meeting up again within seconds, and that needs no notification.
+const TIME_LIMIT_NOTIFY_DELAY: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct StallEvent {
@@ -37,7 +48,56 @@ struct StallEvent {
     elapsed_secs: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AutoEndEvent {
+    #[serde(default)]
+    meeting_id: Option<i64>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StreamingStatusEvent {
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    meeting_id: Option<i64>,
+}
+
 pub fn start(app: AppHandle) {
+    let auto_end_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut sub =
+            screenpipe_events::subscribe_to_event::<AutoEndEvent>("meeting_auto_end_requested");
+        while let Some(event) = sub.next().await {
+            // A meeting that went quiet is usually over, and has its own banner.
+            // Only the time limit can stop capture while the call is still running.
+            if event.data.reason.as_deref() != Some(MEETING_AUTO_END_TIME_LIMIT_REASON) {
+                continue;
+            }
+            // Subscribe before waiting: a session can return within the second.
+            let mut statuses = screenpipe_events::subscribe_to_event::<StreamingStatusEvent>(
+                "meeting_streaming_status_changed",
+            );
+            let app = auto_end_app.clone();
+            tauri::async_runtime::spawn(async move {
+                let meeting_id = event.data.meeting_id;
+                let came_back = tokio::time::timeout(TIME_LIMIT_NOTIFY_DELAY, async {
+                    while let Some(status) = statuses.next().await {
+                        if status.data.active && status.data.meeting_id == meeting_id {
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .await;
+                if !matches!(came_back, Ok(true)) {
+                    handle_time_limit(&app, meeting_id);
+                }
+            });
+        }
+    });
+
     let audio_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut sub =
@@ -70,17 +130,45 @@ fn handle_audio_stall(app: &AppHandle, event: StallEvent) {
         event.meeting_id, event.provider, elapsed
     );
 
-    // OS notification — fires through the system notification center so it
-    // surfaces even when the meeting window is on top of screenpipe. Use
-    // std::thread::spawn to escape the tokio runtime: notify_rust on Linux
-    // calls block_on internally and panics under a live runtime.
+    send_os_notification(
+        app,
+        crate::localization::ui_text("screenpipe is not capturing audio"),
+        crate::localization::ui_format("no audio reached the meeting after {value1}s — check mic permissions or restart the recorder", &[("value1", (elapsed).to_string())]),
+    );
+}
+
+fn handle_time_limit(app: &AppHandle, meeting_id: Option<i64>) {
+    if !pref_enabled(app, "audioCaptureStalled") {
+        debug!("meeting stall: time limit notification skipped by preference");
+        return;
+    }
+
+    warn!(
+        "meeting stall: firing live time limit notification (meeting_id={:?})",
+        meeting_id
+    );
+
+    send_os_notification(
+        app,
+        crate::localization::ui_text("screenpipe stopped transcribing this meeting"),
+        crate::localization::ui_text(
+            "it reached the live time limit — open the note and resume if the call is still going",
+        ),
+    );
+}
+
+/// Fires through the system notification center so it surfaces even when the
+/// meeting window is on top of screenpipe. Uses std::thread::spawn to escape
+/// the tokio runtime: notify_rust on Linux calls block_on internally and panics
+/// under a live runtime.
+fn send_os_notification(app: &AppHandle, title: String, body: String) {
     let app_for_notify = app.clone();
     std::thread::spawn(move || {
         if let Err(e) = app_for_notify
             .notification()
             .builder()
-            .title(crate::localization::ui_text("screenpipe is not capturing audio"))
-            .body(crate::localization::ui_format("no audio reached the meeting after {value1}s — check mic permissions or restart the recorder", &[("value1", (elapsed).to_string())]))
+            .title(title)
+            .body(body)
             .show()
         {
             error!("meeting stall: failed to send OS notification: {}", e);

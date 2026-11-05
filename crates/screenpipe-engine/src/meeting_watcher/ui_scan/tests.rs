@@ -3223,3 +3223,65 @@ fn test_check_signal_match_role_with_name_matches_windows_button() {
         None,
     ));
 }
+
+/// Same contract as the audio-process detector: a reopen restarts live
+/// streaming, and does not re-fire `meeting_started`.
+#[tokio::test]
+async fn reopened_meeting_restarts_live_streaming_without_a_new_start() {
+    use futures::{FutureExt, StreamExt};
+
+    // The event bus is process-wide: a unique app keeps other tests' events out.
+    const APP: &str = "ui-scan-reopen-restarts-streaming";
+    let db = DatabaseManager::new("sqlite::memory:", Default::default())
+        .await
+        .unwrap();
+    let id = db.insert_meeting(APP, "ui_scan", None, None).await.unwrap();
+    let ended_at = (Utc::now() - chrono::Duration::seconds(10))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    db.end_meeting(id, &ended_at, None).await.unwrap();
+    let manual_meeting = tokio::sync::RwLock::new(None);
+    let mut state = MeetingState::Active {
+        meeting_id: -1,
+        app: APP.to_string(),
+        started_at: Utc::now(),
+        last_seen: Instant::now(),
+        is_browser: false,
+    };
+    let mut reattach = screenpipe_events::subscribe_to_event::<serde_json::Value>(
+        screenpipe_audio::meeting_streaming::MEETING_STREAMING_REATTACH_EVENT,
+    );
+    let mut started = screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+
+    apply_state_action(
+        StateAction::StartMeeting {
+            app: APP.to_string(),
+        },
+        &db,
+        &manual_meeting,
+        &mut state,
+        &mut 0,
+        None,
+        &[],
+        &[],
+        false,
+    )
+    .await;
+
+    let restarted = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), reattach.next())
+            .await
+            .expect("a reopen must restart live streaming")
+            .unwrap();
+        if event.data["app"] == APP {
+            break event.data;
+        }
+    };
+    assert_eq!(restarted["meeting_id"], id);
+    while let Some(event) = started.next().now_or_never().flatten() {
+        assert_ne!(
+            event.data["app"], APP,
+            "a reopen must not re-fire pipes through meeting_started"
+        );
+    }
+}

@@ -366,6 +366,7 @@ pub(crate) async fn apply_state_action(
                                 ),
                             }
                         }
+                        crate::meeting_watcher::shared::events::reattach_live_streaming(&recent);
                         (recent.id, "auto_reopen")
                     }
                     Err(e) => {

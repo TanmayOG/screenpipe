@@ -4967,3 +4967,100 @@ async fn pipeline_suppressed_old_room_on_the_live_session_keeps_the_new_meeting(
         .meeting_end
         .is_none());
 }
+
+/// `meeting_ended` already stopped the live session of a reopened meeting, so
+/// without this the note reads as live for the rest of the call with nothing
+/// streaming.
+#[tokio::test]
+async fn reopened_meeting_restarts_live_streaming_without_a_new_start() {
+    // The event bus is process-wide: a unique app keeps other tests' events out.
+    const APP: &str = "audio-process-reopen-restarts-streaming";
+    let (_dir, db) = setup_db().await;
+    let manual_meeting = tokio::sync::RwLock::new(None);
+    let id = db
+        .insert_meeting(APP, "audio_process", None, None)
+        .await
+        .unwrap();
+    end_meeting_ago(&db, id, chrono::Duration::seconds(10)).await;
+    let mut reattach = subscribe_to_event::<serde_json::Value>(
+        screenpipe_audio::meeting_streaming::MEETING_STREAMING_REATTACH_EVENT,
+    );
+    let mut started = subscribe_to_event::<serde_json::Value>("meeting_started");
+
+    assert_eq!(
+        start_or_adopt_auto_meeting(&db, &manual_meeting, APP, None, None, Utc::now()).await,
+        AutoStartOutcome::AdoptedActive(id)
+    );
+
+    let restarted = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), reattach.next())
+            .await
+            .expect("a reopen must restart live streaming")
+            .unwrap();
+        if event.data["app"] == APP {
+            break event.data;
+        }
+    };
+    assert_eq!(restarted["meeting_id"], id);
+    while let Some(event) = started.next().now_or_never().flatten() {
+        assert_ne!(
+            event.data["app"], APP,
+            "a reopen must not re-fire pipes through meeting_started"
+        );
+    }
+}
+
+/// A detected call someone adopted by hand must stay free to be re-detected at
+/// the time limit, or capture stays off while the call keeps running. Every
+/// other end keeps the block: without it the hard ceiling and the silence
+/// timeout would restart the meeting on the next poll.
+#[tokio::test]
+async fn only_an_adopted_call_at_the_time_limit_stays_free_to_be_redetected() {
+    use crate::meeting_watcher::shared::calendar::MeetingAutoEndRequest;
+    use screenpipe_audio::meeting_streaming::MEETING_AUTO_END_TIME_LIMIT_REASON as TIME_LIMIT;
+
+    for (adopted, reason, stays_blocked) in [
+        (true, TIME_LIMIT, false),
+        (false, TIME_LIMIT, true),
+        (true, "live audio inactive", true),
+    ] {
+        let (_dir, db) = setup_db().await;
+        let id = db
+            .insert_meeting("Google Meet", "audio_process", None, None)
+            .await
+            .unwrap();
+        let manual_meeting = tokio::sync::RwLock::new(adopted.then_some(id));
+        let start = Instant::now();
+        let mut state = AudioProcessMeetingState::Active {
+            meeting_id: id,
+            platform: "Google Meet".to_string(),
+            session_key: ProcessKey::from_process(&chrome_process()).unwrap(),
+            meeting_url: None,
+            first_seen_at: start,
+            last_seen_at: start,
+            is_browser: true,
+        };
+        let mut suppressed = Vec::new();
+
+        handle_auto_end_request(
+            MeetingAutoEndRequest {
+                meeting_id: id,
+                reason: Some(reason.to_string()),
+            },
+            &db,
+            &manual_meeting,
+            &mut state,
+            &mut suppressed,
+            &AtomicBool::new(true),
+            &None,
+        )
+        .await;
+
+        assert!(matches!(state, AudioProcessMeetingState::Idle));
+        assert_eq!(
+            !suppressed.is_empty(),
+            stays_blocked,
+            "adopted={adopted}, reason={reason}"
+        );
+    }
+}
